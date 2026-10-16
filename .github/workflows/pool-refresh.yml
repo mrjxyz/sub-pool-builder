@@ -1,4 +1,4 @@
-# sub-pool-builder · 每 6 小时「抓上游 → 三层真探活 → 合成配置 → 写回 CF KV（影子 key）」
+# sub-pool-builder · 每 6 小时「抓上游 → 三层真探活 → 合成配置 → 写回 CF KV（影子 key；开关打开后同时提升进真 key）」
 #
 # 依据：任务书 R-032 §4-S5（cron '20 */6 * * *' + workflow_dispatch）
 #       审查文 §四末条（定时与手动可能叠跑 ⇒ concurrency 组内排队、不取消在跑的 run）
@@ -9,6 +9,7 @@
 # 可选 Vars（非密）：
 #   CF_ACCOUNT_ID / KV_NAMESPACE_TITLE / DEAD_DOMAINS / SUB_USERINFO(secret, 可选)
 #   ALERT_NTFY_TOPIC —— 连续 2 次失败时的 ntfy topic（不配就不告警）
+#   PROMOTE_ON_SCHEDULE —— 'true' 让定时 run 也写真实 key sub:<token>（S6 之后置 true；删掉即回退为只写影子）
 name: pool-refresh
 
 on:
@@ -73,7 +74,7 @@ jobs:
           DEAD_DOMAINS: ${{ vars.DEAD_DOMAINS }}
           # schedule 触发时 inputs 为空 ⇒ 默认按正式刷新跑；手动 dispatch 才受勾选控制
           DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || (inputs.dry_run && 'true' || 'false') }}
-          PROMOTE: ${{ github.event_name == 'schedule' && 'false' || (inputs.promote && 'true' || 'false') }}
+          PROMOTE: ${{ github.event_name == 'schedule' && (vars.PROMOTE_ON_SCHEDULE || 'false') || (inputs.promote && 'true' || 'false') }}
           ONLY_US: ${{ inputs.only_us && 'true' || 'false' }}
           MIN_ALIVE_RATIO: ${{ inputs.min_alive_ratio || '0.3' }}
           KV_PREFIX: ${{ inputs.kv_prefix || 'test:' }}
