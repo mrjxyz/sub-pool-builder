@@ -339,8 +339,9 @@ def fetch_gslege(region_code: str, source: str) -> list[dict]:
             continue
         head, _, rest = line.partition("#")
         h = head.strip()
-        m = re.fullmatch(r"(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})", h) or \
-            re.fullmatch(r"(\d{1,3}(?:\.\d{1,3}){3})", h)
+        # 单模式可选端口：写成「带端口 or 不带端口」两个 fullmatch 会让 IP-only 行
+        # 命中第二个模式（只有 1 个捕获组），随后取 m.group(2) 直接 IndexError。
+        m = re.fullmatch(r"(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?", h)
         if not m or not valid_ip(m.group(1)):
             continue
         remark = rest.strip()
