@@ -1,0 +1,124 @@
+# sub-pool-builder · 每 6 小时「抓上游 → 三层真探活 → 合成配置 → 写回 CF KV（影子 key）」
+#
+# 依据：任务书 R-032 §4-S5（cron '20 */6 * * *' + workflow_dispatch）
+#       审查文 §四末条（定时与手动可能叠跑 ⇒ concurrency 组内排队、不取消在跑的 run）
+#
+# 需要配好的 Secrets（⛔ 任何凭据都不进仓库、不进日志）：
+#   CF_API_TOKEN  —— Cloudflare #2 账号 KV 写 token（Workers KV Storage Read&Edit）
+#   CFYES_KEY     —— hostmonit 优化 IP 接口 key（v10 里硬编码那把，迁移后只进 secret）
+# 可选 Vars（非密）：
+#   CF_ACCOUNT_ID / KV_NAMESPACE_TITLE / DEAD_DOMAINS / SUB_USERINFO(secret, 可选)
+#   ALERT_NTFY_TOPIC —— 连续 2 次失败时的 ntfy topic（不配就不告警）
+name: pool-refresh
+
+on:
+  schedule:
+    - cron: '20 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'true = 完全不联网不写 KV（只验配额/去重）'
+        type: boolean
+        default: false
+      promote:
+        description: 'true = 额外写真实 key sub:<token>（仅 S6 验收通过后）'
+        type: boolean
+        default: false
+      only_us:
+        description: 'true = 只收美国地区候选（家族名仍用标准名）'
+        type: boolean
+        default: false
+      min_alive_ratio:
+        description: '存活率下限，低于它判源面故障并不写 KV'
+        required: false
+        default: '0.3'
+      kv_prefix:
+        description: '写入 key 前缀，默认 test:（影子 key）；改空需勾 promote'
+        required: false
+        default: 'test:'
+
+# 同一时刻只允许一个刷新在跑：后到的排队等前一个结束（cancel-in-progress: false），
+# 否则两次 run 会交错写同一个 KV key。
+concurrency:
+  group: pool-refresh
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read          # 失败告警步骤要回读本 workflow 的上一次 run 结论
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'      # Actions ubuntu-latest 自带 3.11/3.12；脚本只用标准库
+
+      - name: Syntax self-check
+        run: python3 -m py_compile build.py
+
+      - name: Refresh pool (shadow keys only)
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CFYES_KEY: ${{ secrets.CFYES_KEY }}
+          SUB_USERINFO: ${{ secrets.SUB_USERINFO }}
+          CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+          KV_NAMESPACE_TITLE: ${{ vars.KV_NAMESPACE_TITLE }}
+          DEAD_DOMAINS: ${{ vars.DEAD_DOMAINS }}
+          # schedule 触发时 inputs 为空 ⇒ 默认按正式刷新跑；手动 dispatch 才受勾选控制
+          DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || (inputs.dry_run && 'true' || 'false') }}
+          PROMOTE: ${{ github.event_name == 'schedule' && 'false' || (inputs.promote && 'true' || 'false') }}
+          ONLY_US: ${{ inputs.only_us && 'true' || 'false' }}
+          MIN_ALIVE_RATIO: ${{ inputs.min_alive_ratio || '0.3' }}
+          KV_PREFIX: ${{ inputs.kv_prefix || 'test:' }}
+        run: |
+          set -euo pipefail
+          ARGS=(--kv-prefix "${KV_PREFIX:-test:}" --min-alive-ratio "${MIN_ALIVE_RATIO:-0.3}"
+                --only-us "${ONLY_US:-false}" --out built-config.json)
+          if [ "${PROMOTE:-false}" = "true" ]; then ARGS+=(--promote); fi
+          if [ "${DRY_RUN:-false}" = "true" ]; then ARGS+=(--dry-run --skip-kv-write); fi
+          echo "执行: python3 build.py ${ARGS[*]}"   # 只回显参数名，不含任何凭据
+          python3 build.py "${ARGS[@]}"
+
+      - name: Upload run stats (脱敏后，无 token / 无 userinfo / 无节点 uuid)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: refresh-stats-${{ github.run_id }}
+          path: refresh-stats.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # 合成的配置里有 VLESS uuid 与订阅 token ⇒ 默认不上传产物，只在显式开开关时留 1 天
+      - name: Upload built config (opt-in)
+        if: ${{ vars.UPLOAD_CONFIG_ARTIFACT == 'true' && !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: built-config-${{ github.run_id }}
+          path: built-config.json
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Alert on 2 consecutive failures
+        if: ${{ failure() && vars.ALERT_NTFY_TOPIC != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NTFY_TOPIC: ${{ vars.ALERT_NTFY_TOPIC }}
+        run: |
+          set -uo pipefail
+          prev=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/pool-refresh.yml/runs?per_page=2" \
+                 --jq '[.workflow_runs[] | .conclusion] | .[1] // "none"' || echo none)
+          echo "上一次 run 结论: ${prev}"
+          if [ "${prev}" = "failure" ]; then
+            curl -s -m 10 -H "Title: sub-pool-builder 连续 2 次失败" \
+              -d "run ${GITHUB_RUN_ID} 失败，且上一次也失败。看 Actions 日志（退出码 2=源面故障/3=缩量保护/4=KV 回读不一致/5=正对照全灭即测量通道故障）。" \
+              "https://ntfy.sh/${NTFY_TOPIC}" || true
+          else
+            echo "仅本次失败，未达连续 2 次 ⇒ 暂不告警"
+          fi
