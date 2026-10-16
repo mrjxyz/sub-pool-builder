@@ -791,8 +791,10 @@ def run_positive_control(ws_backends: list[dict], timeout: float, retries: int
     走完整三层。这些后端是订阅里正在用的活口子，若**全部**连不上 101，说明是本机/runner 出口
     或探测代码坏了，而不是优选池死了 —— 此时后续算出来的任何存活率都是假账。
     """
-    def one(be: dict) -> tuple[str, bool, str]:
-        name = str(be.get("name") or be.get("server") or "?")
+    def one(i_be: tuple[int, dict]) -> tuple[str, bool, str]:
+        i, be = i_be
+        # ⛔ 日志与 artifact 都在公开仓可见 ⇒ 只报序号，不报后端域名/节点名
+        name = f"backend#{i}"
         host = be.get("server") or ""
         port = int(be.get("port") or 443)
         if not host:
@@ -802,8 +804,9 @@ def run_positive_control(ws_backends: list[dict], timeout: float, retries: int
         tag = "101" if r.passes else (r.error or r.detail.get("0") or "fail")
         return name, bool(r.passes), str(tag)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, max(1, len(ws_backends)))) as ex:
-        return list(ex.map(one, ws_backends))
+    jobs = list(enumerate(ws_backends))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, max(1, len(jobs)))) as ex:
+        return list(ex.map(one, jobs))
 
 
 # =====================================================================
@@ -1371,19 +1374,23 @@ def main(argv: list[str] | None = None) -> int:
 
     kv: CFKV | None = None
     if not args.dry_run and not args.skip_kv_write:
+        # ⚠ GitHub 对「未配置的 var」传的是**空字符串**而不是缺键 ⇒ os.environ.get(k, default)
+        # 会返回 ''，把默认值吃掉（2026-10-16 首次 Actions 实跑就是栽在这里：title='' 找不到命名空间）。
+        ns_title = os.environ.get("KV_NAMESPACE_TITLE") or KV_NAMESPACE_TITLE
         try:
-            kv = CFKV(cf_token, os.environ.get("CF_ACCOUNT_ID"),
-                      os.environ.get("KV_NAMESPACE_TITLE", KV_NAMESPACE_TITLE))
-            log(f"KV 就绪：绑定名 {KV_BINDING_NAME}，命名空间 title={kv.ns_title}"
+            kv = CFKV(cf_token, os.environ.get("CF_ACCOUNT_ID") or None, ns_title)
+            log(f"KV 就绪：绑定名 {KV_BINDING_NAME}，命名空间 title={ns_title}"
                 "（account/namespace id 将于首次调用从 API 响应中取得，不写死）")
         except Exception as e:
             log("致命:", redact(e))
+            _dump_stats(stats, args)
             return 1
 
     try:
         base = load_base(kv, args.base_from, args.dry_run)
     except Exception as e:
         log("致命:", redact(e))
+        _dump_stats(stats, args)
         return 1
 
     # base 死域名核对钩子（S4）：只统计出现次数，⛔ 不在本任务里改 base
@@ -1402,6 +1409,7 @@ def main(argv: list[str] | None = None) -> int:
     log(f"base 后端 {len(backends)} 条，可克隆 ws 模板 {len(ws_backends)} 条")
     if not ws_backends:
         log("没有可克隆的 ws 后端，无法生成优选池")
+        _dump_stats(stats, args)
         return 1
 
     if args.dry_run:
