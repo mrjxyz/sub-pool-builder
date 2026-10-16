@@ -1022,11 +1022,18 @@ def pick_backend(passes: list[int] | None, n: int, start: int, exclude: int | No
     return None
 
 
-def build_config(base: dict, families: dict[str, list[dict]], stats: dict) -> str:
-    backends = list(base.get("proxies") or [])
+def build_config(base: dict, families: dict[str, list[dict]], stats: dict,
+                 drop_backends: set[str] = frozenset()) -> str:
+    # drop_backends：正对照已证明连不上的 ws 后端。它们留在产物里只是给用户多几个「点了没反应」的坑，
+    # ⛔ 没有实测证据的后端（非 ws 模板那几条）不在此列，一律原样保留。
+    all_backends = list(base.get("proxies") or [])
+    backends = [p for p in all_backends if p.get("name") not in drop_backends]
+    stats["dropped_dead_backends"] = len(all_backends) - len(backends)
     stats["reality_fixed"] = fix_reality_opts(backends)
-    # 只有 ws 且 template!=false 的后端能当克隆模板（非 CF 托管后端如 Vercel 反代不可克隆）
-    ws_backends = [p for p in backends if p.get("network") == "ws" and p.get("template") is not False]
+    # 克隆模板表必须用**未过滤**的全量列表：探活时 passes 记的是这张表里的下标，
+    # 一旦在这里删条目就会让下标错位（n 变小 ⇒ pick_backend 取不到 allowed ⇒ 整池归零）。
+    ws_backends = [p for p in all_backends
+                   if p.get("network") == "ws" and p.get("template") is not False]
     n = len(ws_backends)
     proxies: list[dict] = []
     skipped_x = 0
@@ -1428,6 +1435,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # 正对照闸门：先证明「探测通道本身是活的」，再让通道去判几千个候选的死活。
     # 对照组全灭 ⇒ 出口/代码故障，本次不产出任何存活结论（台账 L2 第⑤条的落地）。
+    drop_backends: set[str] = set()
     if not args.dry_run and not args.no_probe:
         ctl = run_positive_control(ws_backends, args.timeout, args.retries)
         stats["positive_control"] = [{"backend": n, "alive": a, "why": w} for n, a, w in ctl]
@@ -1438,6 +1446,19 @@ def main(argv: list[str] | None = None) -> int:
             if kv is not None:
                 _write_meta(kv, args, stats)
             return 5
+        # 有实测证据说死的 ws 后端不再进产物（非 ws 的那几条没有证据，保留）。
+        # ⛔ 只剔「客观已死」：530/1016＝源站已下线、gaierror＝域名根本不解析、no-server＝配置残缺。
+        # TimeoutError 一类**不许剔** —— runner 出口不等于用户出口，地域性超时是假阴性，
+        # 剔掉会把用户这边其实能用的口子从订阅里删掉（台账 L2 第⑤条的同形风险）。
+        objectively_dead = ("530", "1016", "gaierror", "no-server")
+        drop_idx = {i for i, (_, a, w) in enumerate(ctl)
+                    if not a and any(tag in str(w) for tag in objectively_dead)}
+        drop_backends = {ws_backends[i]["name"] for i in drop_idx if ws_backends[i].get("name")}
+        stats["positive_control_drop_idx"] = sorted(drop_idx)
+        stats["positive_control_kept_uncertain"] = [i for i in range(len(ctl))
+                                                    if not ctl[i][1] and i not in drop_idx]
+        log("已判死并从产物里剔除的后端下标:", str(sorted(drop_idx)) or "无",
+            "（超时类一律保留：%s）" % stats["positive_control_kept_uncertain"])
 
     if args.no_probe:
         results = {f"{c['ip']}|{c['port']}": ProbeResult(c["ip"], c["port"]) for c in cands}
@@ -1473,7 +1494,7 @@ def main(argv: list[str] | None = None) -> int:
             _write_meta(kv, args, stats)
         return 2
 
-    yaml_text = build_config(base, families, stats)
+    yaml_text = build_config(base, families, stats, drop_backends)
     new_count = count_proxies(yaml_text) or 0
     stats["yaml_bytes"] = len(yaml_text.encode("utf-8"))
     stats["yaml_sha256"] = sha256_of(yaml_text)
