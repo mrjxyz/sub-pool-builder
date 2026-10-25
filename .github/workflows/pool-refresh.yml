@@ -8,7 +8,7 @@
 #   CFYES_KEY     —— hostmonit 优化 IP 接口 key（v10 里硬编码那把，迁移后只进 secret）
 # 可选 Vars（非密）：
 #   CF_ACCOUNT_ID / KV_NAMESPACE_TITLE / DEAD_DOMAINS / SUB_USERINFO(secret, 可选)
-#   ALERT_NTFY_TOPIC —— 连续 2 次失败时的 ntfy topic（不配就不告警）
+#   ALERT_NTFY_TOPIC —— 连续 2 次失败时的 ntfy topic（secret；不配就不告警。⛔ 不要用 vars，公开仓可读）
 #   PROMOTE_ON_SCHEDULE —— 'true' 让定时 run 也写真实 key sub:<token>（S6 之后置 true；删掉即回退为只写影子）
 name: pool-refresh
 
@@ -96,21 +96,14 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      # 合成的配置里有 VLESS uuid 与订阅 token ⇒ 默认不上传产物，只在显式开开关时留 1 天
-      - name: Upload built config (opt-in)
-        if: ${{ vars.UPLOAD_CONFIG_ARTIFACT == 'true' && !cancelled() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: built-config-${{ github.run_id }}
-          path: built-config.json
-          if-no-files-found: ignore
-          retention-days: 1
+      # ⛔ 已移除 "Upload built config" 步骤：built-config.json 含 VLESS uuid 与真实后端域名，
+      # 本仓是公开仓库，artifact 任何人可下载。需要排查时用 refresh-stats.json（已脱敏）。
 
       - name: Alert on 2 consecutive failures
-        if: ${{ failure() && vars.ALERT_NTFY_TOPIC != '' }}
+        if: ${{ failure() && secrets.ALERT_NTFY_TOPIC != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          NTFY_TOPIC: ${{ vars.ALERT_NTFY_TOPIC }}
+          NTFY_TOPIC: ${{ secrets.ALERT_NTFY_TOPIC }}
         run: |
           set -uo pipefail
           prev=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/pool-refresh.yml/runs?per_page=2" \
