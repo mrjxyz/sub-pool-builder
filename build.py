@@ -147,6 +147,12 @@ def register_secret(value: str | None) -> None:
         _SECRETS.append(value)
 
 
+def _mask_path(path: str) -> str:
+    """遮蔽 KV key 路径末段（可能是 sub:<token>），避免 token 被打进公开 Actions 日志。"""
+    head, sep, tail = path.rpartition("/")
+    return f"{head}{sep}<KEY>" if sep else "<PATH>"
+
+
 def redact(text: object) -> str:
     s = str(text)
     for secret in _SECRETS:
@@ -868,6 +874,7 @@ def assign_families(cands: list[dict], probe_results: dict, only_us: bool,
     dropped_whitelist = dropped_dead = dropped_cap = dropped_unmeasured = 0
     advisory_added = 0
     fallback = list(fallback_backends or [])
+    _is_advisory = False
 
     if advisory and fallback:
         # 探活降级：存活候选排前面（0），探活失败的后排（1），未测量的最后（2）。
@@ -914,9 +921,14 @@ def assign_families(cands: list[dict], probe_results: dict, only_us: bool,
             if not (advisory and fallback):
                 dropped_dead += 1
                 continue
-            # 探活降级：不判死，借用活后端下标入池，探活结果仅作排序参考
-            pr = _AdvisoryPass(fallback)
-            advisory_added += 1
+            # 探活降级：只放行「TCP 通了但后续层失败」的候选 —— TCP 都连不上是客观死，
+            # 数据中心出口都不通，用户侧只会更差，不许降级。
+            if not getattr(pr, "tcp_ok", False):
+                dropped_dead += 1
+                continue
+            # 只借一条后端：未验证的 IP 不许产出 X 变体（第二条后端纯属轮转臆测）
+            pr = _AdvisoryPass(fallback[:1])
+            _is_advisory = True
 
         fam = pick_family(fams, families, rr)
         if fam is None:
@@ -933,7 +945,11 @@ def assign_families(cands: list[dict], probe_results: dict, only_us: bool,
             nodes = len(passes)
         families[fam].append({"ip": it["ip"], "port": int(it["port"]),
                               "passes": passes, "nodes": nodes,
+                              "advisory": bool(_is_advisory),
                               "source": it.get("source")})
+        if _is_advisory:
+            advisory_added += 1
+        _is_advisory = False
 
     families = {k: v for k, v in families.items() if v}
     stats["quota"] = {
@@ -1172,9 +1188,9 @@ class CFKV:
                 detail = " ".join(str(x.get("code")) for x in errs if isinstance(x, dict))
             except Exception:
                 pass
-            raise FetchError(f"CF API {method} {path.split('?')[0]} → HTTP {e.code} {detail}".strip()) from None
+            raise FetchError(f"CF API {method} {_mask_path(path)} → HTTP {e.code} {detail}".strip()) from None
         except Exception as e:
-            raise FetchError(f"CF API {method} {path.split('?')[0]} → {type(e).__name__}") from None
+            raise FetchError(f"CF API {method} {_mask_path(path)} → {type(e).__name__}") from None
 
     def resolve(self) -> tuple[str, str]:
         """account id / namespace id 都从**当次**响应取，绝不写死字面值。"""
@@ -1563,6 +1579,8 @@ def main(argv: list[str] | None = None) -> int:
             log("列 sub: 前缀失败:", redact(e))
     if not tokens:
         tokens = ["0000000000000000"] if args.dry_run else []
+    for _t in tokens:
+        register_secret(_t)          # 双保险：redact 对 urlencoded/裸 token 子串都能命中
     stats["sub_key_count"] = len(tokens)
     log(f"待写订阅 {len(tokens)} 份（key 名不回显，只记 sha8）")
 
@@ -1666,6 +1684,7 @@ def _print_dry_run_summary(stats: dict, families: dict) -> None:
 
 
 def _write_meta(kv: CFKV | None, args, stats: dict) -> None:
+    _dump_stats(stats, args)          # 任何 exit 路径都留证据（exit 2/3/5 原本什么都不留）
     if kv is None or args.skip_kv_write:
         return
     meta_key = f"{args.kv_prefix}meta:last_refresh"
