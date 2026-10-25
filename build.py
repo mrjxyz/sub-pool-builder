@@ -853,11 +853,31 @@ def pick_family(fams: list[str], families: dict, rr: dict) -> str | None:
     return None
 
 
+class _AdvisoryPass:
+    """探活降级用的占位结果：探活失败但仍要入池的候选，借用已知活后端的下标。"""
+    __slots__ = ("passes",)
+    def __init__(self, passes: list[int]):
+        self.passes = list(passes)
+
+
 def assign_families(cands: list[dict], probe_results: dict, only_us: bool,
-                    stats: dict) -> dict[str, list[dict]]:
+                    stats: dict, advisory: bool = False,
+                    fallback_backends: list[int] | None = None) -> dict[str, list[dict]]:
     families: dict[str, list[dict]] = {}
     rr: dict[tuple, int] = {}
     dropped_whitelist = dropped_dead = dropped_cap = dropped_unmeasured = 0
+    advisory_added = 0
+    fallback = list(fallback_backends or [])
+
+    if advisory and fallback:
+        # 探活降级：存活候选排前面（0），探活失败的后排（1），未测量的最后（2）。
+        # ⛔ 只降优先级、不判死 —— runner 出口≠用户出口，境外探活失败是假阴性。
+        def _rank(it: dict) -> int:
+            pr = probe_results.get(f"{it['ip']}|{it['port']}")
+            if pr is None:
+                return 2
+            return 0 if pr.passes else 1
+        cands = sorted(cands, key=_rank)
 
     for it in cands:
         fams: list[str] | None = None
@@ -891,8 +911,12 @@ def assign_families(cands: list[dict], probe_results: dict, only_us: bool,
             dropped_unmeasured += 1
             continue
         if not pr.passes:
-            dropped_dead += 1
-            continue
+            if not (advisory and fallback):
+                dropped_dead += 1
+                continue
+            # 探活降级：不判死，借用活后端下标入池，探活结果仅作排序参考
+            pr = _AdvisoryPass(fallback)
+            advisory_added += 1
 
         fam = pick_family(fams, families, rr)
         if fam is None:
@@ -918,6 +942,8 @@ def assign_families(cands: list[dict], probe_results: dict, only_us: bool,
         "dropped_probe_dead": dropped_dead,
         "dropped_unmeasured": dropped_unmeasured,
         "dropped_all_families_full": dropped_cap,
+        "probe_advisory": bool(advisory),
+        "advisory_added": advisory_added,
         "per_family_slots": {k: len(v) for k, v in families.items()},
         "per_family_target_nodes": {k: FAMILY_TARGET[k] for k in families},
         "per_family_nodes": {k: family_nodes(families, k) for k in families},
@@ -1352,6 +1378,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="最多探测多少个 (ip,port)，超出按未测量拒收（0=不限）；防 Actions 出口被打进滥用名单")
     ap.add_argument("--min-alive-ratio", type=float, default=ALIVE_MIN_RATIO,
                     help="聚合存活率低于此值 ⇒ 判源面故障，不写 KV，退出码 2")
+    ap.add_argument("--probe-advisory", dest="probe_advisory",
+                    action=argparse.BooleanOptionalAction,
+                    default=(os.environ.get("PROBE_ADVISORY", "true").lower() != "false"),
+                    help="探活降级为参考（默认开）：探活失败的候选不判死，按存活优先排序后仍可入池")
     ap.add_argument("--no-probe", action="store_true",
                     help="跳过探活（全部后端视为可用；仅调试配额用，⛔ 不许用于正式刷新）")
     ap.add_argument("--skip-kv-write", action="store_true", help="只跑流程不写 KV")
@@ -1486,7 +1516,23 @@ def main(argv: list[str] | None = None) -> int:
             _write_meta(kv, args, stats)
         return 2
 
-    families = assign_families(cands, results, only_us, stats)
+    # 探活降级：兜底后端 = 正对照判活的；若没有正对照（--no-probe）则用全部未剔除的
+    advisory_on = bool(getattr(args, "probe_advisory", False))
+    fallback_backends: list[int] = []
+    if advisory_on:
+        ctl = stats.get("positive_control") or []
+        if ctl:
+            fallback_backends = [i for i, c in enumerate(ctl) if c.get("alive")]
+            if not fallback_backends:
+                _drop = set(stats.get("positive_control_drop_idx") or [])
+                fallback_backends = [i for i in range(len(ws_backends)) if i not in _drop]
+        else:
+            fallback_backends = list(range(len(ws_backends)))
+        log(f"探活降级为参考: 兜底后端下标 {fallback_backends}（探活失败不再判死）")
+
+    families = assign_families(cands, results, only_us, stats,
+                               advisory=advisory_on,
+                               fallback_backends=fallback_backends)
     if not families:
         log("优选池为空 —— 保留旧配置，不写 KV")
         stats["abort_reason"] = "empty_pool"
