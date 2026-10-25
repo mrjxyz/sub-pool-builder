@@ -100,12 +100,13 @@ jobs:
       # 本仓是公开仓库，artifact 任何人可下载。需要排查时用 refresh-stats.json（已脱敏）。
 
       - name: Alert on 2 consecutive failures
-        if: ${{ failure() && secrets.ALERT_NTFY_TOPIC != '' }}
+        if: ${{ failure() }}
         env:
           GH_TOKEN: ${{ github.token }}
           NTFY_TOPIC: ${{ secrets.ALERT_NTFY_TOPIC }}
         run: |
           set -uo pipefail
+          if [ -z "${NTFY_TOPIC:-}" ]; then echo "未配置 ALERT_NTFY_TOPIC（secret），跳过告警"; exit 0; fi
           prev=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/pool-refresh.yml/runs?per_page=2" \
                  --jq '[.workflow_runs[] | .conclusion] | .[1] // "none"' || echo none)
           echo "上一次 run 结论: ${prev}"
