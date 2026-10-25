@@ -754,7 +754,7 @@ def simulate_probe(c: dict, backends: list[dict]) -> ProbeResult:
 
 
 def probe_all(cands: list[dict], backends: list[dict], args, sim: bool) -> tuple[dict, dict]:
-    jobs = [{"ip": c["ip"], "port": c["port"]} for c in
+    jobs = [{"ip": c["ip"], "port": c["port"], "source": c.get("source")} for c in
             {f"{c['ip']}|{c['port']}": c for c in cands}.values()]
     # 安全阀：Actions 出口是数据中心 IP，对海量随机 IP 做 TCP+TLS+WS 有触发滥用检测的风险，
     # 且 40min workflow 超时会留下半跑状态。超出上限的候选按「未测量」拒收（fail-closed），
@@ -763,7 +763,20 @@ def probe_all(cands: list[dict], backends: list[dict], args, sim: bool) -> tuple
         log(f"⚠ 候选 (ip,port) 共 {len(jobs)} 条 > 探活上限 {args.probe_limit} ⇒ 截断，"
             f"其余 {len(jobs) - args.probe_limit} 条按未测量拒收")
         stats_cut = len(jobs) - args.probe_limit
-        jobs = jobs[:args.probe_limit]
+        # 按源轮转抽样：直接切前 N 条会让排在后面的源（gslege/hostmonit 等）整源饿死
+        _buckets: dict[str, list[dict]] = {}
+        for _j in jobs:
+            _buckets.setdefault(str(_j.get("source") or "?"), []).append(_j)
+        _sampled: list[dict] = []
+        while len(_sampled) < args.probe_limit and any(_buckets.values()):
+            for _k in list(_buckets):
+                if not _buckets[_k]:
+                    continue
+                _sampled.append(_buckets[_k].pop(0))
+                if len(_sampled) >= args.probe_limit:
+                    break
+        jobs = _sampled
+        stats_cut = 0
     else:
         stats_cut = 0
     log(f"探活开始: {len(jobs)} 个 (ip,port) × {len(backends)} 条 ws 后端，"
@@ -976,69 +989,6 @@ def assign_families(cands: list[dict], probe_results: dict, only_us: bool,
 # 8) 配置合成（沿用 v10 buildConfig 全部行为）
 # =====================================================================
 
-def parse_vless_share(uri: str) -> dict | None:
-    m = re.match(r"^vless://([^@]+)@([^:?#]+):(\d+)(?:\?([^#]*))?(?:#(.*))?$", uri)
-    if not m:
-        return None
-    uuid, host, port, q, name_raw = m.groups()
-    params = dict(urllib.parse.parse_qsl(q or "", keep_blank_values=True))
-    name = re.sub(r"\s+", " ", urllib.parse.unquote(name_raw or "")).strip()
-    net = params.get("type") or "tcp"
-    sec = params.get("security") or "none"
-    sni = params.get("sni") or params.get("peer") or host
-    node = {"name": name or f"{host}:{port}", "type": "vless", "server": host,
-            "port": int(port), "uuid": uuid, "network": net, "udp": True,
-            "tls": sec in ("tls", "reality"), "servername": sni}
-    if params.get("fp"):
-        node["client-fingerprint"] = params["fp"]
-    if params.get("flow"):
-        node["flow"] = params["flow"]
-    if params.get("alpn"):
-        node["alpn"] = [x for x in params["alpn"].split(",") if x]
-    if params.get("allowInsecure") in ("1", "true"):
-        node["skip-cert-verify"] = True
-    if net == "ws":
-        node["ws-opts"] = {"path": params.get("path") or "/",
-                           "headers": {"Host": params.get("host") or sni or host}}
-    elif net == "grpc":
-        node["grpc-opts"] = {"grpc-service-name": params.get("serviceName") or ""}
-    if sec == "reality":
-        ro = {"public-key": params.get("pbk") or ""}
-        if params.get("sid"):
-            ro["short-id"] = params["sid"]
-        if params.get("spx"):
-            ro["spider-x"] = params["spx"]
-        node["reality-opts"] = ro
-    return node
-
-
-def parse_vless_block(text: str) -> list[dict]:
-    t = text or ""
-    if "vless://" not in t:
-        try:
-            cleaned = re.sub(r"\s+", "", t)
-            pad = (-len(cleaned)) % 4
-            t = base64.b64decode(cleaned + "=" * pad).decode("utf-8", errors="replace")
-        except Exception:
-            return []
-    out = []
-    for line in re.split(r"\r?\n", t):
-        u = line.strip()
-        if not u.startswith("vless://"):
-            continue
-        n = parse_vless_share(u)
-        if not n:
-            continue
-        if n["server"] in ("127.0.0.1", "127.0.0.53", "localhost", "0.0.0.0"):
-            continue
-        if not valid_ip(n["server"]) and not re.fullmatch(r"[a-z0-9.\-]+", n["server"], re.I):
-            continue
-        if not n["uuid"] or not n["port"]:
-            continue
-        out.append(n)
-    return out
-
-
 def fix_reality_opts(backends: list[dict]) -> int:
     """驼峰 publicKey → 连字符 public-key（mihomo 只认后者；2026-09-28 事故防御，照搬 v10）。"""
     fixed = 0
@@ -1077,6 +1027,9 @@ def build_config(base: dict, families: dict[str, list[dict]], stats: dict,
     ws_backends = [p for p in all_backends
                    if p.get("network") == "ws" and p.get("template") is not False]
     n = len(ws_backends)
+    # 已判死后端在 ws_backends 里的下标。pick_backend 只保证下标在范围内，
+    # 不保证不在 drop 集 ⇒ 这里显式过滤，避免克隆出指向死域名的节点。
+    _dead_idx = {i for i, p in enumerate(ws_backends) if p.get("name") in drop_backends}
     proxies: list[dict] = []
     skipped_x = 0
     nodes_per_family: dict[str, int] = {}
@@ -1086,20 +1039,29 @@ def build_config(base: dict, families: dict[str, list[dict]], stats: dict,
         for idx, slot in enumerate(slots):
             if n == 0:
                 break
-            main = pick_backend(slot.get("passes"), n, idx % n, None)
+            _p = slot.get("passes")
+            if _p is None:
+                _allowed = None
+            else:
+                _allowed = [i for i in _p if i not in _dead_idx]
+                if not _allowed:
+                    continue          # 该槽位只指向已判死后端 ⇒ 不出节点
+            main = pick_backend(_allowed, n, idx % n, None)
             if main is None:
                 continue
             q = json.loads(json.dumps(ws_backends[main], ensure_ascii=False))
             q["name"] = f"{fam}-{idx + 1:02d}{suffix}"
             q["server"] = slot["ip"]
             q["port"] = int(slot.get("port") or 443)
-            q["servername"] = ws_backends[main].get("server")
+            # 优先用模板自己的 servername（SNI≠server 的后端如 CF for SaaS 不能被覆盖）
+            _sni = ws_backends[main].get("servername") or ws_backends[main].get("server")
+            q["servername"] = _sni
             if isinstance(q.get("ws-opts"), dict) and isinstance(q["ws-opts"].get("headers"), dict):
-                q["ws-opts"]["headers"]["Host"] = ws_backends[main].get("server")
+                q["ws-opts"]["headers"]["Host"] = _sni
             proxies.append(q)
             made += 1
             # X 变体：同 IP 同端口、换挂另一条后端域名（v10 口径；只探到 1 条通过时不硬凑）
-            second = pick_backend(slot.get("passes"), n, (idx + 1) % n, main)
+            second = pick_backend(_allowed, n, (idx + 1) % n, main)
             if second is None:
                 skipped_x += 1
                 continue
@@ -1107,9 +1069,10 @@ def build_config(base: dict, families: dict[str, list[dict]], stats: dict,
             x["name"] = f"{fam}-{idx + 1:02d}X{suffix}"
             x["server"] = slot["ip"]
             x["port"] = int(slot.get("port") or 443)
-            x["servername"] = ws_backends[second].get("server")
+            _sni2 = ws_backends[second].get("servername") or ws_backends[second].get("server")
+            x["servername"] = _sni2
             if isinstance(x.get("ws-opts"), dict) and isinstance(x["ws-opts"].get("headers"), dict):
-                x["ws-opts"]["headers"]["Host"] = ws_backends[second].get("server")
+                x["ws-opts"]["headers"]["Host"] = _sni2
             proxies.append(x)
             made += 1
         nodes_per_family[fam] = nodes_per_family.get(fam, 0) + made
@@ -1451,10 +1414,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.dead_domains:
         dead = [d.strip() for d in args.dead_domains.split(",") if d.strip()]
         text = json.dumps(base, ensure_ascii=False)
-        stats["base_dead_domain_hits"] = {d: text.count(d) for d in dead}
-        if any(stats["base_dead_domain_hits"].values()):
-            log("⚠ base 仍含待清理域名（本任务不改，计数已写 meta）:",
-                " ".join(f"{d}:{c}" for d, c in stats["base_dead_domain_hits"].items() if c))
+        # ⛔ artifact 上传到公开仓库 ⇒ 只记命中条数，绝不回显域名本身
+        _hit_cnt = sum(1 for d in dead if d in text)
+        stats["base_dead_domain_hits"] = _hit_cnt
+        if _hit_cnt:
+            log(f"⚠ base 仍含待清理域名（本任务不改）: 命中 {_hit_cnt}/{len(dead)} 条（域名不回显）")
 
     backends = base.get("proxies") or []
     ws_backends = [p for p in backends if p.get("network") == "ws" and p.get("template") is not False]
@@ -1496,9 +1460,18 @@ def main(argv: list[str] | None = None) -> int:
         # ⛔ 只剔「客观已死」：530/1016＝源站已下线、gaierror＝域名根本不解析、no-server＝配置残缺。
         # TimeoutError 一类**不许剔** —— runner 出口不等于用户出口，地域性超时是假阴性，
         # 剔掉会把用户这边其实能用的口子从订阅里删掉（台账 L2 第⑤条的同形风险）。
-        objectively_dead = ("530", "1016", "gaierror", "no-server")
-        drop_idx = {i for i, (_, a, w) in enumerate(ctl)
-                    if not a and any(tag in str(w) for tag in objectively_dead)}
+        def _is_objective_dead(tag: str) -> bool:
+            """只认「客观已下线」：源站 530/1016、域名不解析、配置残缺、协议层明确拒绝。
+            ⛔ tls:* 一律不判死 —— runner 出口≠用户出口，地域性 TLS 抖动是假阴性。"""
+            if tag == "no-server":
+                return True
+            kind, _, rest = tag.partition(":")
+            if kind == "tcp" and rest.startswith("gaierror"):
+                return True
+            if kind == "ws" and rest.split(":")[0] in ("530", "1016", "400", "404"):
+                return True
+            return False
+        drop_idx = {i for i, (_, a, w) in enumerate(ctl) if not a and _is_objective_dead(str(w))}
         drop_backends = {ws_backends[i]["name"] for i in drop_idx if ws_backends[i].get("name")}
         stats["positive_control_drop_idx"] = sorted(drop_idx)
         stats["positive_control_kept_uncertain"] = [i for i in range(len(ctl))
@@ -1507,6 +1480,11 @@ def main(argv: list[str] | None = None) -> int:
             "（超时类一律保留：%s）" % stats["positive_control_kept_uncertain"])
 
     if args.no_probe:
+        # ⛔ 闸门：--no-probe 让所有候选拿到全部后端下标（含已判死的），且 alive_ratio=1.0 会骗过
+        # 0.3 存活率闸门。必须限制在「不写 KV」的场合，否则一条命令就能把死后端推上生产。
+        if not args.dry_run and not args.skip_kv_write:
+            log("⛔ --no-probe 只允许配合 --dry-run 或 --skip-kv-write（拒绝写 KV）")
+            return 2
         results = {f"{c['ip']}|{c['port']}": ProbeResult(c["ip"], c["port"]) for c in cands}
         for r in results.values():
             r.tcp_ok, r.passes = True, list(range(len(ws_backends)))
