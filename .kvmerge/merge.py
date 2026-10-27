@@ -9,17 +9,14 @@ TOK = os.environ["CF_API_TOKEN"]
 API = "https://api.cloudflare.com/client/v4"
 NAMES = {"AGENTSCOPE-VLESS", "AGENTSCOPE-VMess", "AGENTSCOPE-Trojan"}
 
-
 def call(path, data=None, method=None):
     req = urllib.request.Request(API + path, data=data, method=method)
     req.add_header("Authorization", "Bearer " + TOK)
     with urllib.request.urlopen(req, timeout=90) as r:
         return r.read()
 
-
 def q(k):
     return urllib.parse.quote(k, safe="")
-
 
 def to_clash(uri):
     scheme, rest = uri.split("://", 1)
@@ -32,7 +29,6 @@ def to_clash(uri):
                 "cipher": "auto", "udp": True, "tls": True, "servername": c.get("sni") or c.get("host"),
                 "client-fingerprint": "chrome", "skip-cert-verify": False, "network": "ws",
                 "ws-opts": {"path": path, "headers": {"Host": c.get("host") or c.get("sni")}}}
-    frag = rest.split("#", 1)[1] if "#" in rest else ""
     head, query = rest.split("?", 1)
     query = query.split("#")[0]
     params = {}
@@ -41,8 +37,9 @@ def to_clash(uri):
             k, v = pair.split("=", 1)
             params[k] = v
     secret, hostport = head.rsplit("@", 1)
-    server = hostport.split(":")[0]
-    port = int((hostport.split(":") + ["443"])[1] or 443)
+    parts = hostport.split(":")
+    server = parts[0]
+    port = int(parts[1]) if len(parts) > 1 and parts[1] else 443
     path = params.get("path", "/").split("#")[0]
     host = params.get("host") or params.get("sni") or server
     if scheme == "vless":
@@ -55,54 +52,47 @@ def to_clash(uri):
             "skip-cert-verify": False, "network": "ws",
             "ws-opts": {"path": path, "headers": {"Host": host}}}
 
-
-def merge_into_cfg(cfg):
+def merge_into_cfg(cfg, mine):
     proxies = cfg.get("proxies") or []
-    keep = [p for p in proxies if str(p.get("name")) not in NAMES]
-    cfg["proxies"] = keep + MINE
+    cfg["proxies"] = [p for p in proxies if str(p.get("name")) not in NAMES] + mine
     for g in cfg.get("proxy-groups") or []:
         pl = g.get("proxies")
         if isinstance(pl, list):
-            base = [x for x in pl if x not in NAMES]
-            g["proxies"] = base + [p["name"] for p in MINE]
+            g["proxies"] = [x for x in pl if x not in NAMES] + [p["name"] for p in mine]
     return len(cfg["proxies"])
-
 
 raw = urllib.request.urlopen(SUB_URL, timeout=60).read().strip()
 text = base64.b64decode(raw + b"=" * (-len(raw) % 4)).decode()
 MINE = [to_clash(l) for l in text.splitlines() if l.strip()]
-print("fetched nodes:", [m["name"] for m in MINE])
+print("fetched:", [m["name"] for m in MINE])
 
-ns_list = json.loads(call(f"/accounts/{ACCT}/storage/kv/namespaces?per_page=50"))["result"]
+ns_list = json.loads(call("/accounts/%s/storage/kv/namespaces?per_page=50" % ACCT))["result"]
 ns = next((n["id"] for n in ns_list if n.get("title") == KV_TITLE), None)
 if not ns:
-    print("namespace not found")
-    sys.exit(3)
+    print("namespace not found"); sys.exit(3)
 print("ns:", ns)
 
 for key in (BASE_KEY, LIVE_KEY):
     try:
-        body = call(f"/accounts/{ACCT}/storage/kv/namespaces/{ns}/values/{q(key)}")
+        body = call("/accounts/%s/storage/kv/namespaces/%s/values/%s" % (ACCT, ns, q(key)))
     except Exception as e:
-        print(key, "read failed", type(e).__name__)
-        continue
+        print(key, "read failed", type(e).__name__); continue
     if not body:
-        print(key, "empty")
-        continue
+        print(key, "empty"); continue
     obj = json.loads(body)
     if key == BASE_KEY:
-        total = merge_into_cfg(obj)
+        total = merge_into_cfg(obj, MINE)
         out = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
-        call(f"/accounts/{ACCT}/storage/kv/namespaces/{ns}/values/{q(key)}", data=out, method="PUT")
-        back = json.loads(call(f"/accounts/{ACCT}/storage/kv/namespaces/{ns}/values/{q(key)}"))
+        call("/accounts/%s/storage/kv/namespaces/%s/values/%s" % (ACCT, ns, q(key)), data=out, method="PUT")
+        back = json.loads(call("/accounts/%s/storage/kv/namespaces/%s/values/%s" % (ACCT, ns, q(key))))
         got = {p.get("name") for p in (back.get("proxies") or [])}
     else:
         y = json.loads(obj.get("yaml") or "{}")
-        total = merge_into_cfg(y)
+        total = merge_into_cfg(y, MINE)
         obj["yaml"] = json.dumps(y, ensure_ascii=False, separators=(",", ":"))
         out = json.dumps(obj, ensure_ascii=False).encode()
-        call(f"/accounts/{ACCT}/storage/kv/namespaces/{ns}/values/{q(key)}", data=out, method="PUT")
-        back = json.loads(call(f"/accounts/{ACCT}/storage/kv/namespaces/{ns}/values/{q(key)}"))
+        call("/accounts/%s/storage/kv/namespaces/%s/values/%s" % (ACCT, ns, q(key)), data=out, method="PUT")
+        back = json.loads(call("/accounts/%s/storage/kv/namespaces/%s/values/%s" % (ACCT, ns, q(key))))
         yy = json.loads(back.get("yaml") or "{}")
         got = {p.get("name") for p in (yy.get("proxies") or [])}
     print(key, "written total=", total, "all3=", NAMES.issubset(got))

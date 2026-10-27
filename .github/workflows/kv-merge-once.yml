@@ -1,0 +1,18 @@
+name: kv-merge-once
+on:
+  push:
+    paths:
+      - '.kvmerge/**'
+  workflow_dispatch:
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Merge agentscope nodes into KV
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: python3 .kvmerge/merge.py
