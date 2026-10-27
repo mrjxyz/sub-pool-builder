@@ -1,0 +1,32 @@
+name: huoge stats push
+
+# 替代坏掉的 huoge-green-lake-6618 Worker（根路径 1101），
+# 直接读 D1 拿凭据 → 查 CF 用量 → 编辑 TG 里那条既有看板消息。
+# 脚本本体：huoge-stats-push.py（与本 workflow 同仓库根目录）
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # 每 30 分钟
+  workflow_dispatch:          # 支持手动触发
+
+concurrency:
+  group: huoge-stats-push
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Push stats
+        env:
+          CF_D1_TOKEN: ${{ secrets.CF_D1_TOKEN }}
+        run: |
+          python3 huoge-stats-push.py --dry-run
+          python3 huoge-stats-push.py
