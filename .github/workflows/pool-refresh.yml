@@ -69,6 +69,8 @@ jobs:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CFYES_KEY: ${{ secrets.CFYES_KEY }}
           SUB_USERINFO: ${{ secrets.SUB_USERINFO }}
+          # 自建 VPS 节点（JSON 数组）：内容只在 secret 里，⛔ 不进仓库/日志；不配则产物与改动前一致
+          EXTRA_NODES: ${{ secrets.EXTRA_NODES }}
           CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
           KV_NAMESPACE_TITLE: ${{ vars.KV_NAMESPACE_TITLE }}
           DEAD_DOMAINS: ${{ vars.DEAD_DOMAINS }}

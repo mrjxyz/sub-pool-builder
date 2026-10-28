@@ -1015,7 +1015,8 @@ def pick_backend(passes: list[int] | None, n: int, start: int, exclude: int | No
 
 
 def build_config(base: dict, families: dict[str, list[dict]], stats: dict,
-                 drop_backends: set[str] = frozenset()) -> str:
+                 drop_backends: set[str] = frozenset(),
+                 extra_nodes: list[dict] | None = None) -> str:
     # drop_backends：正对照已证明连不上的 ws 后端。它们留在产物里只是给用户多几个「点了没反应」的坑，
     # ⛔ 没有实测证据的后端（非 ws 模板那几条）不在此列，一律原样保留。
     all_backends = list(base.get("proxies") or [])
@@ -1111,10 +1112,59 @@ def build_config(base: dict, families: dict[str, list[dict]], stats: dict,
     cfg = dict(base)
     cfg["proxies"] = [*backends, *proxies]
     cfg["proxy-groups"] = base_groups
+    # 自建 VPS 节点（2026-10-28）：内容只从 secret EXTRA_NODES 读，⛔ 仓库里零凭据。
+    # 不注入时整段是 no-op，产物与改动前逐字节一致。
+    extra = [p for p in (extra_nodes or []) if isinstance(p, dict) and p.get("name")]
+    if extra:
+        extra_names = [p["name"] for p in extra]
+        cfg["proxies"] = [p for p in cfg["proxies"] if p.get("name") not in extra_names] + extra
+        own_name = "🖥 自有VPS"
+        own_proxies = [*extra_names, auto_group["name"], "DIRECT"]
+        existing = next((g for g in base_groups if g.get("name") == own_name), None)
+        if existing is not None:
+            existing["type"] = "select"
+            existing["proxies"] = own_proxies
+        else:
+            base_groups.append({"name": own_name, "type": "select", "proxies": own_proxies})
+        if main and isinstance(main.get("proxies"), list):
+            main["proxies"] = [own_name] + [x for x in main["proxies"] if x != own_name]
+        stats["extra_nodes"] = len(extra)
     stats["proxies_total"] = len(cfg["proxies"])
     # json.dumps 必须 ensure_ascii=False：JS 的 JSON.stringify 直出 UTF-8 汉字，
     # 默认 True 会把中文转义成 \uXXXX，体积与观感都变（L1 落盘验约束）。
     return json.dumps(cfg, indent=1, ensure_ascii=False)
+
+
+EXTRA_NODES_ENV = "EXTRA_NODES"   # secret：自建 VPS 节点 JSON 数组；⛔ 值绝不进仓库、日志、artifact
+
+
+def load_extra_nodes() -> list[dict]:
+    """自 secret 读自建 VPS 节点。未配置 / 格式不对 ⇒ 返回空列表，主流程照旧。
+
+    只做形状校验，不做任何网络动作；uuid 一进来就登记进脱敏表，
+    保证后续 log()/异常文本里不会出现节点凭据。
+    """
+    raw = (os.environ.get(EXTRA_NODES_ENV) or "").strip()
+    if not raw:
+        return []
+    try:
+        arr = json.loads(raw)
+    except Exception as e:
+        log("自建节点 JSON 解析失败（按无自建节点继续）:", redact(e))
+        return []
+    if not isinstance(arr, list):
+        log("自建节点格式不是数组（按无自建节点继续）")
+        return []
+    keep: list[dict] = []
+    for item in arr:
+        if not isinstance(item, dict):
+            continue
+        if not (item.get("name") and item.get("server") and item.get("uuid")):
+            continue
+        register_secret(str(item.get("uuid")))
+        register_secret(str(item.get("server")))
+        keep.append(item)
+    return keep
 
 
 # =====================================================================
@@ -1534,7 +1584,7 @@ def main(argv: list[str] | None = None) -> int:
             _write_meta(kv, args, stats)
         return 2
 
-    yaml_text = build_config(base, families, stats, drop_backends)
+    yaml_text = build_config(base, families, stats, drop_backends, load_extra_nodes())
     new_count = count_proxies(yaml_text) or 0
     stats["yaml_bytes"] = len(yaml_text.encode("utf-8"))
     stats["yaml_sha256"] = sha256_of(yaml_text)
