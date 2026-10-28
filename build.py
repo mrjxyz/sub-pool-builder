@@ -1128,6 +1128,10 @@ def build_config(base: dict, families: dict[str, list[dict]], stats: dict,
             base_groups.append({"name": own_name, "type": "select", "proxies": own_proxies})
         if main and isinstance(main.get("proxies"), list):
             main["proxies"] = [own_name] + [x for x in main["proxies"] if x != own_name]
+        if main:
+            # 默认落到自建节点组：与 Mac 侧 Clash Verge 扩展脚本的口径一致，
+            # 新装/新导入的客户端拉下来即用自有节点，不用手动点。
+            main["now"] = own_name
         stats["extra_nodes"] = len(extra)
     stats["proxies_total"] = len(cfg["proxies"])
     # json.dumps 必须 ensure_ascii=False：JS 的 JSON.stringify 直出 UTF-8 汉字，
